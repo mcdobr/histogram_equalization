@@ -99,10 +99,33 @@ int main(int argc, char** argv)
     uint8_t* host_image = (uint8_t*)malloc(number_of_pixels * sizeof(uint8_t));
     memcpy_s(host_image, number_of_pixels * sizeof(uint8_t), image.data, number_of_pixels * sizeof(uint8_t));
 
+    // Time transfer to GPU
+    cudaEvent_t start_transfer, end_transfer;
+    cudaEventCreate(&start_transfer);
+    cudaEventCreate(&end_transfer);
+    cudaEventRecord(start_transfer);
+
+    // Copy image to GPU
     uint8_t* dev_image = nullptr;
     gpu_error_check(cudaMalloc(&dev_image, number_of_pixels * sizeof(uint8_t)));
     gpu_error_check(cudaMemcpy(dev_image, host_image, number_of_pixels * sizeof(uint8_t), cudaMemcpyHostToDevice));
 
+    cudaEventRecord(end_transfer, 0);
+    cudaEventSynchronize(end_transfer);
+
+    float transfer_elapsed_time;
+    cudaEventElapsedTime(&transfer_elapsed_time, start_transfer, end_transfer);
+    cudaEventDestroy(start_transfer);
+    cudaEventDestroy(end_transfer);
+    cout << std::setprecision(5) << "The time to transfer image to GPU: " << transfer_elapsed_time << " ms\n";
+
+    // Time histogram equalization
+    cudaEvent_t start_histogram_equalization, end_histogram_equalization;
+    cudaEventCreate(&start_histogram_equalization);
+    cudaEventCreate(&end_histogram_equalization);
+    cudaEventRecord(start_histogram_equalization);
+
+    // Initialize histogram on device
     uint32_t* dev_histogram = nullptr;
     gpu_error_check(cudaMalloc(&dev_histogram, number_of_bins * sizeof(uint32_t)));
     gpu_error_check(cudaMemset(dev_histogram, 0, number_of_bins * sizeof(uint32_t)));
@@ -117,6 +140,7 @@ int main(int argc, char** argv)
     gpu_error_check(cudaMalloc(&dev_cdf, number_of_bins * sizeof(uint32_t)));
     gpu_error_check(cudaMemset(dev_cdf, 0, number_of_bins * sizeof(uint32_t)));
 
+    // Compute the cumulative distribution function
     uint32_t* temp = nullptr;
     gpu_error_check(cudaMalloc(&temp, number_of_bins * sizeof(uint32_t)));
     gpu_error_check(cudaMemcpy(temp, dev_histogram, number_of_bins * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
@@ -139,12 +163,45 @@ int main(int argc, char** argv)
     gpu_error_check(cudaGetLastError());
     gpu_error_check(cudaDeviceSynchronize());
 
+    cudaEventRecord(end_histogram_equalization, 0);
+    cudaEventSynchronize(end_histogram_equalization);
+
+    float histogram_equalization_elapsed_time;
+    cudaEventElapsedTime(&histogram_equalization_elapsed_time, start_histogram_equalization,
+                         end_histogram_equalization);
+    cudaEventDestroy(start_histogram_equalization);
+    cudaEventDestroy(end_histogram_equalization);
+    cout << std::setprecision(5) << "The time to equalize the histogram on the GPU for the input image: " <<
+        histogram_equalization_elapsed_time << " ms\n";
+
+
+    // Time the transfer back to the CPU
+    cudaEvent_t start_transfer_back, end_transfer_back;
+    cudaEventCreate(&start_transfer_back);
+    cudaEventCreate(&end_transfer_back);
+    cudaEventRecord(start_transfer_back);
+
     // Copy the equalized image back to the CPU
     uint8_t* host_equalized_image = nullptr;
     host_equalized_image = (uint8_t*)malloc(number_of_pixels * sizeof(uint8_t));
     gpu_error_check(
         cudaMemcpy(host_equalized_image, dev_equalized_image, number_of_pixels * sizeof(uint8_t), cudaMemcpyDeviceToHost
         ));
+
+    cudaEventRecord(end_transfer_back, 0);
+    cudaEventSynchronize(end_transfer_back);
+
+    float transfer_back_elapsed_time;
+    cudaEventElapsedTime(&transfer_back_elapsed_time, start_transfer_back, end_transfer_back);
+    cudaEventDestroy(start_transfer_back);
+    cudaEventDestroy(end_transfer_back);
+    cout << std::setprecision(5) << "The time to transfer the equalized image back to CPU: " <<
+        transfer_back_elapsed_time << " ms\n";
+
+
+    cout << std::setprecision(5) <<
+        "The total time (without loading initial image from filesystem and displaying them at the end): "
+        << transfer_elapsed_time + histogram_equalization_elapsed_time + transfer_back_elapsed_time << " ms\n";
 
     // Create and image for displaying
     cv::Mat equalized_image = cv::Mat(image.rows, image.cols, CV_8UC1, host_equalized_image);
