@@ -1,121 +1,221 @@
-
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
-#include <stdio.h>
+// For __syncthreads to not be not found anymore
+#ifndef __CUDACC__
+#define __CUDACC__
+#endif
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
+#include <cstdlib>
+#include <cstdint>
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <opencv2/core/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <device_functions.h>
 
-__global__ void addKernel(int *c, const int *a, const int *b)
+using namespace std;
+
+const int max_threads_per_block = 1024;
+const int number_of_bins = 256;
+
+#define gpu_error_check(ans) { gpu_assert((ans), __FILE__, __LINE__); }
+
+inline void gpu_assert(const cudaError_t code, const char* file, const int line, const bool abort = true)
 {
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+    if (code != cudaSuccess)
+    {
+        cerr << "GPU_assert: " << cudaGetErrorString(code) << " " << file << " " << line << ".\n";
+        if (abort)
+        {
+            exit(code);
+        }
+    }
 }
 
-int main()
+cv::Mat read_image(const string image_path)
 {
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
+    cv::Mat image = cv::imread(image_path, cv::IMREAD_GRAYSCALE);
+    if (image.empty())
+    {
+        cerr << "The provided image at path " << image_path << " could not be read\n";
+        exit(-2);
+    }
+    return image;
+}
 
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
+__global__ void histogram(const uint8_t* image, uint32_t* histogram)
+{
+    const uint32_t index = blockDim.x * blockIdx.x + threadIdx.x;
+    atomicAdd(&histogram[image[index]], 1);
+}
+
+// Naive implementation of inclusive scan algorithm based on the exclusive scan presented in
+// https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf 
+// Doesn't work
+// It uses a continuous double buffer, so a single memory location with twice the number of slots as the input.
+// The complexity of this is O(N*logN) whereas the trivial CPU single threaded version is O(N).
+// It handles only arrays smaller than max number of threads per 1 block.
+__global__ void scan(uint32_t* output, const uint32_t* const input, const uint32_t n, const uint32_t offset)
+{
+    const unsigned thread_index = threadIdx.x;
+    if (thread_index >= offset)
+    {
+        output[thread_index] = input[thread_index] + input[thread_index - offset];
+    }
+    else
+    {
+        output[thread_index] = input[thread_index];
+    }
+}
+
+__global__ void equalize_image(const uint8_t* original_image, const size_t number_of_pixels, const uint32_t* cdf,
+                               uint8_t* equalized_image)
+{
+    const int index = blockDim.x * blockIdx.x + threadIdx.x;
+    equalized_image[index] = cdf[original_image[index]] * (number_of_bins - 1) / number_of_pixels;
+}
+
+// Also see https://www.mygreatlearning.com/blog/histogram-equalization-explained/#Algorithm
+int main(int argc, char** argv)
+{
+    if (argc < 2)
+    {
+        fprintf(stderr, "An image file path is needed!\n");
+        exit(-1);
     }
 
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
+    string image_path(argv[1]);
+    cv::Mat image = read_image(image_path);
 
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
+    if (!image.isContinuous())
+    {
+        std::cerr << "Image is not read but stitched together so it is not continuous\n";
+        exit(-3);
     }
 
+    size_t number_of_pixels = image.total();
+    uint8_t* host_image = (uint8_t*)malloc(number_of_pixels * sizeof(uint8_t));
+    memcpy_s(host_image, number_of_pixels * sizeof(uint8_t), image.data, number_of_pixels * sizeof(uint8_t));
+
+    // Time transfer to GPU
+    cudaEvent_t start_transfer, end_transfer;
+    cudaEventCreate(&start_transfer);
+    cudaEventCreate(&end_transfer);
+    cudaEventRecord(start_transfer);
+
+    // Copy image to GPU
+    uint8_t* dev_image = nullptr;
+    gpu_error_check(cudaMalloc(&dev_image, number_of_pixels * sizeof(uint8_t)));
+    gpu_error_check(cudaMemcpy(dev_image, host_image, number_of_pixels * sizeof(uint8_t), cudaMemcpyHostToDevice));
+
+    cudaEventRecord(end_transfer, 0);
+    cudaEventSynchronize(end_transfer);
+
+    float transfer_elapsed_time;
+    cudaEventElapsedTime(&transfer_elapsed_time, start_transfer, end_transfer);
+    cudaEventDestroy(start_transfer);
+    cudaEventDestroy(end_transfer);
+    cout << std::setprecision(5) << "The time to transfer image to GPU: " << transfer_elapsed_time << " ms\n";
+
+    // Time histogram equalization
+    cudaEvent_t start_histogram_equalization, end_histogram_equalization;
+    cudaEventCreate(&start_histogram_equalization);
+    cudaEventCreate(&end_histogram_equalization);
+    cudaEventRecord(start_histogram_equalization);
+
+    // Initialize histogram on device
+    uint32_t* dev_histogram = nullptr;
+    gpu_error_check(cudaMalloc(&dev_histogram, number_of_bins * sizeof(uint32_t)));
+    gpu_error_check(cudaMemset(dev_histogram, 0, number_of_bins * sizeof(uint32_t)));
+
+    // Compute histogram of image using a naive kernel
+    histogram<<<number_of_pixels / max_threads_per_block, max_threads_per_block>>>(dev_image, dev_histogram);
+    gpu_error_check(cudaGetLastError());
+    gpu_error_check(cudaDeviceSynchronize());
+
+    // Compute the cumulative distribution function using a naive
+    uint32_t* dev_cdf = nullptr;
+    gpu_error_check(cudaMalloc(&dev_cdf, number_of_bins * sizeof(uint32_t)));
+    gpu_error_check(cudaMemset(dev_cdf, 0, number_of_bins * sizeof(uint32_t)));
+
+    // Compute the cumulative distribution function
+    uint32_t* temp = nullptr;
+    gpu_error_check(cudaMalloc(&temp, number_of_bins * sizeof(uint32_t)));
+    gpu_error_check(cudaMemcpy(temp, dev_histogram, number_of_bins * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    for (uint32_t offset = 1; offset < number_of_bins; offset *= 2)
+    {
+        scan<<<1, number_of_bins, 2 * number_of_bins * sizeof(int32_t)>>>(dev_cdf, temp, number_of_bins, offset);
+        gpu_error_check(cudaGetLastError());
+        gpu_error_check(cudaDeviceSynchronize());
+        if (offset * 2 < number_of_bins)
+        {
+            std::swap(temp, dev_cdf);
+        }
+    }
+
+    // Compute the new image values
+    uint8_t* dev_equalized_image = nullptr;
+    gpu_error_check(cudaMalloc(&dev_equalized_image, number_of_pixels * sizeof(uint8_t)));
+    equalize_image<<<number_of_pixels / max_threads_per_block, max_threads_per_block>>>(
+        dev_image, number_of_pixels, dev_cdf, dev_equalized_image);
+    gpu_error_check(cudaGetLastError());
+    gpu_error_check(cudaDeviceSynchronize());
+
+    cudaEventRecord(end_histogram_equalization, 0);
+    cudaEventSynchronize(end_histogram_equalization);
+
+    float histogram_equalization_elapsed_time;
+    cudaEventElapsedTime(&histogram_equalization_elapsed_time, start_histogram_equalization,
+                         end_histogram_equalization);
+    cudaEventDestroy(start_histogram_equalization);
+    cudaEventDestroy(end_histogram_equalization);
+    cout << std::setprecision(5) << "The time to equalize the histogram on the GPU for the input image: " <<
+        histogram_equalization_elapsed_time << " ms\n";
+
+
+    // Time the transfer back to the CPU
+    cudaEvent_t start_transfer_back, end_transfer_back;
+    cudaEventCreate(&start_transfer_back);
+    cudaEventCreate(&end_transfer_back);
+    cudaEventRecord(start_transfer_back);
+
+    // Copy the equalized image back to the CPU
+    uint8_t* host_equalized_image = nullptr;
+    host_equalized_image = (uint8_t*)malloc(number_of_pixels * sizeof(uint8_t));
+    gpu_error_check(
+        cudaMemcpy(host_equalized_image, dev_equalized_image, number_of_pixels * sizeof(uint8_t), cudaMemcpyDeviceToHost
+        ));
+
+    cudaEventRecord(end_transfer_back, 0);
+    cudaEventSynchronize(end_transfer_back);
+
+    float transfer_back_elapsed_time;
+    cudaEventElapsedTime(&transfer_back_elapsed_time, start_transfer_back, end_transfer_back);
+    cudaEventDestroy(start_transfer_back);
+    cudaEventDestroy(end_transfer_back);
+    cout << std::setprecision(5) << "The time to transfer the equalized image back to CPU: " <<
+        transfer_back_elapsed_time << " ms\n";
+
+
+    cout << std::setprecision(5) <<
+        "The total time (without loading initial image from filesystem and displaying them at the end): "
+        << transfer_elapsed_time + histogram_equalization_elapsed_time + transfer_back_elapsed_time << " ms\n";
+
+    // Create and image for displaying
+    cv::Mat equalized_image = cv::Mat(image.rows, image.cols, CV_8UC1, host_equalized_image);
+
+    cv::imshow("Original image", image);
+    cv::imshow("Equalized image", equalized_image);
+    cv::waitKey(0);
+
+    // Free all memory
+    free(host_image);
+    free(host_equalized_image);
+    cudaFree(dev_image);
+    cudaFree(dev_histogram);
+    cudaFree(dev_cdf);
+    cudaFree(dev_equalized_image);
     return 0;
-}
-
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
-
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
-
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
-
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
 }
