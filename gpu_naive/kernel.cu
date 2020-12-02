@@ -16,6 +16,7 @@
 #include <device_functions.h>
 
 using namespace std;
+using namespace cv;
 
 const int max_threads_per_block = 1024;
 const int number_of_bins = 256;
@@ -34,9 +35,9 @@ inline void gpu_assert(const cudaError_t code, const char* file, const int line,
     }
 }
 
-cv::Mat read_image(const string image_path)
+Mat read_image(const string image_path)
 {
-    cv::Mat image = cv::imread(image_path, cv::IMREAD_GRAYSCALE);
+    Mat image = imread(image_path, IMREAD_GRAYSCALE);
     if (image.empty())
     {
         cerr << "The provided image at path " << image_path << " could not be read\n";
@@ -105,7 +106,7 @@ int main(int argc, char** argv)
     }
 
     string image_path(argv[1]);
-    cv::Mat image = read_image(image_path);
+    Mat image = read_image(image_path);
 
     if (!image.isContinuous())
     {
@@ -173,11 +174,11 @@ int main(int argc, char** argv)
         ));
 
     // Create and image for displaying
-    cv::Mat equalized_image = cv::Mat(image.rows, image.cols, CV_8UC1, host_equalized_image);
+    Mat equalized_image = Mat(image.rows, image.cols, CV_8UC1, host_equalized_image);
 
-    cv::imshow("Original image", image);
-    cv::imshow("Equalized image", equalized_image);
-    cv::waitKey(0);
+    imshow("Original image", image);
+    imshow("Equalized image", equalized_image);
+    waitKey(0);
 
     // Free all memory
     free(host_image);
