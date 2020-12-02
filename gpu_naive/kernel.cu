@@ -53,40 +53,22 @@ __global__ void histogram(const uint8_t* image, uint32_t* histogram)
 }
 
 // Naive implementation of inclusive scan algorithm based on the exclusive scan presented in
-// https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf
+// https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf 
+// Doesn't work
 // It uses a continuous double buffer, so a single memory location with twice the number of slots as the input.
 // The complexity of this is O(N*logN) whereas the trivial CPU single threaded version is O(N).
 // It handles only arrays smaller than max number of threads per 1 block.
-// Doesn't work
-__global__ void scan(uint32_t* prefix_sums, uint32_t* arr, const int n)
+__global__ void scan(uint32_t* output, const uint32_t* const input, const uint32_t n, const uint32_t offset)
 {
-    volatile __shared__ uint32_t temp[512]; // todo: is there any way to parametrize this in CUDA?
-    // Load input into shared memory.    
-    // This is exclusive scan, so shift right by one    
-    // and set first element to 0
-    if (threadIdx.x < n)
+    const unsigned thread_index = threadIdx.x;
+    if (thread_index >= offset)
     {
-        temp[threadIdx.x] = arr[threadIdx.x];
+        output[thread_index] = input[thread_index] + input[thread_index - offset];
     }
-    __syncthreads();
-
-    int pout = 1, pin = 1;
-    for (int offset = 1; offset < n; offset *= 2)
+    else
     {
-        pout = 1 - pout; // swap double buffer indices
-        pin = 1 - pout;
-        if (threadIdx.x >= offset)
-        {
-            temp[pout * n + threadIdx.x] += temp[pin * n + threadIdx.x - offset];
-        }
-        else
-        {
-            temp[pout * n + threadIdx.x] = temp[pin * n + threadIdx.x];
-        }
-        __syncthreads();
+        output[thread_index] = input[thread_index];
     }
-
-    prefix_sums[threadIdx.x] = temp[pout * n + threadIdx.x]; // write output
 }
 
 __global__ void equalize_image(const uint8_t* original_image, const size_t number_of_pixels, const uint32_t* cdf,
@@ -118,10 +100,33 @@ int main(int argc, char** argv)
     uint8_t* host_image = (uint8_t*)malloc(number_of_pixels * sizeof(uint8_t));
     memcpy_s(host_image, number_of_pixels * sizeof(uint8_t), image.data, number_of_pixels * sizeof(uint8_t));
 
+    // Time transfer to GPU
+    cudaEvent_t start_transfer, end_transfer;
+    cudaEventCreate(&start_transfer);
+    cudaEventCreate(&end_transfer);
+    cudaEventRecord(start_transfer);
+
+    // Copy image to GPU
     uint8_t* dev_image = nullptr;
     gpu_error_check(cudaMalloc(&dev_image, number_of_pixels * sizeof(uint8_t)));
     gpu_error_check(cudaMemcpy(dev_image, host_image, number_of_pixels * sizeof(uint8_t), cudaMemcpyHostToDevice));
 
+    cudaEventRecord(end_transfer, 0);
+    cudaEventSynchronize(end_transfer);
+
+    float transfer_elapsed_time;
+    cudaEventElapsedTime(&transfer_elapsed_time, start_transfer, end_transfer);
+    cudaEventDestroy(start_transfer);
+    cudaEventDestroy(end_transfer);
+    cout << std::setprecision(5) << "The time to transfer image to GPU: " << transfer_elapsed_time << " ms\n";
+
+    // Time histogram equalization
+    cudaEvent_t start_histogram_equalization, end_histogram_equalization;
+    cudaEventCreate(&start_histogram_equalization);
+    cudaEventCreate(&end_histogram_equalization);
+    cudaEventRecord(start_histogram_equalization);
+
+    // Initialize histogram on device
     uint32_t* dev_histogram = nullptr;
     gpu_error_check(cudaMalloc(&dev_histogram, number_of_bins * sizeof(uint32_t)));
     gpu_error_check(cudaMemset(dev_histogram, 0, number_of_bins * sizeof(uint32_t)));
@@ -131,32 +136,25 @@ int main(int argc, char** argv)
     gpu_error_check(cudaGetLastError());
     gpu_error_check(cudaDeviceSynchronize());
 
-    uint32_t* host_histogram = (uint32_t*)malloc(number_of_bins * sizeof(uint32_t));
-    cudaMemcpy(host_histogram, dev_histogram, number_of_bins * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    // free(host_histogram);
-
-
-    // todo: remove this because scan is broken
-    uint32_t* debug_cdf = (uint32_t*)malloc(number_of_bins * sizeof(uint32_t));
-    debug_cdf[0] = host_histogram[0];
-    for (int i = 1; i < number_of_bins; ++i)
-    {
-        debug_cdf[i] = debug_cdf[i - 1] + host_histogram[i];
-    }
-
-
     // Compute the cumulative distribution function using a naive
     uint32_t* dev_cdf = nullptr;
     gpu_error_check(cudaMalloc(&dev_cdf, number_of_bins * sizeof(uint32_t)));
-    gpu_error_check(cudaMemcpy(dev_cdf, debug_cdf, number_of_bins * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    // gpu_error_check(cudaMemset(dev_cdf, 0, number_of_bins * sizeof(uint32_t)));
-    // scan<<<1, number_of_bins>>>(dev_cdf, dev_histogram, number_of_bins);
-    // gpu_error_check(cudaGetLastError());
-    // gpu_error_check(cudaDeviceSynchronize());
+    gpu_error_check(cudaMemset(dev_cdf, 0, number_of_bins * sizeof(uint32_t)));
 
-    uint32_t *host_cdf = (uint32_t*)malloc(number_of_bins * sizeof(uint32_t));
-    cudaMemcpy(host_cdf, dev_cdf, number_of_bins * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    // free(host_cdf);
+    // Compute the cumulative distribution function
+    uint32_t* temp = nullptr;
+    gpu_error_check(cudaMalloc(&temp, number_of_bins * sizeof(uint32_t)));
+    gpu_error_check(cudaMemcpy(temp, dev_histogram, number_of_bins * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    for (uint32_t offset = 1; offset < number_of_bins; offset *= 2)
+    {
+        scan<<<1, number_of_bins, 2 * number_of_bins * sizeof(int32_t)>>>(dev_cdf, temp, number_of_bins, offset);
+        gpu_error_check(cudaGetLastError());
+        gpu_error_check(cudaDeviceSynchronize());
+        if (offset * 2 < number_of_bins)
+        {
+            std::swap(temp, dev_cdf);
+        }
+    }
 
     // Compute the new image values
     uint8_t* dev_equalized_image = nullptr;
@@ -166,12 +164,45 @@ int main(int argc, char** argv)
     gpu_error_check(cudaGetLastError());
     gpu_error_check(cudaDeviceSynchronize());
 
+    cudaEventRecord(end_histogram_equalization, 0);
+    cudaEventSynchronize(end_histogram_equalization);
+
+    float histogram_equalization_elapsed_time;
+    cudaEventElapsedTime(&histogram_equalization_elapsed_time, start_histogram_equalization,
+                         end_histogram_equalization);
+    cudaEventDestroy(start_histogram_equalization);
+    cudaEventDestroy(end_histogram_equalization);
+    cout << std::setprecision(5) << "The time to equalize the histogram on the GPU for the input image: " <<
+        histogram_equalization_elapsed_time << " ms\n";
+
+
+    // Time the transfer back to the CPU
+    cudaEvent_t start_transfer_back, end_transfer_back;
+    cudaEventCreate(&start_transfer_back);
+    cudaEventCreate(&end_transfer_back);
+    cudaEventRecord(start_transfer_back);
+
     // Copy the equalized image back to the CPU
     uint8_t* host_equalized_image = nullptr;
     host_equalized_image = (uint8_t*)malloc(number_of_pixels * sizeof(uint8_t));
     gpu_error_check(
         cudaMemcpy(host_equalized_image, dev_equalized_image, number_of_pixels * sizeof(uint8_t), cudaMemcpyDeviceToHost
         ));
+
+    cudaEventRecord(end_transfer_back, 0);
+    cudaEventSynchronize(end_transfer_back);
+
+    float transfer_back_elapsed_time;
+    cudaEventElapsedTime(&transfer_back_elapsed_time, start_transfer_back, end_transfer_back);
+    cudaEventDestroy(start_transfer_back);
+    cudaEventDestroy(end_transfer_back);
+    cout << std::setprecision(5) << "The time to transfer the equalized image back to CPU: " <<
+        transfer_back_elapsed_time << " ms\n";
+
+
+    cout << std::setprecision(5) <<
+        "The total time (without loading initial image from filesystem and displaying them at the end): "
+        << transfer_elapsed_time + histogram_equalization_elapsed_time + transfer_back_elapsed_time << " ms\n";
 
     // Create and image for displaying
     Mat equalized_image = Mat(image.rows, image.cols, CV_8UC1, host_equalized_image);
