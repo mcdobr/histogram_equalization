@@ -1,20 +1,44 @@
 // cpu.cpp : This file contains the 'main' function. Program execution begins and ends there.
 //
 
+#include <opencv2/opencv.hpp>
+#include "opencv2/imgcodecs.hpp"
+#include "opencv2/highgui.hpp"
+#include "opencv2/imgproc.hpp"
 #include <iostream>
+#include <chrono> 
 
-int main()
+using namespace std::chrono;
+using namespace cv;
+using namespace std;
+
+int main(int argc, char** argv)
 {
-    std::cout << "Hello World!\n";
+    string image_path(argv[1]);
+
+    Mat src = imread(image_path, IMREAD_COLOR);
+    if (src.empty())
+    {
+        cout << "Could not open or find the image!\n" << endl;
+        cout << "Usage: " << argv[0] << " <Input image>" << endl;
+        return -1;
+    }
+
+    cvtColor(src, src, COLOR_BGR2GRAY);
+    Mat dst;
+    //Time before the histogram is computed
+    auto start = high_resolution_clock::now();
+    equalizeHist(src, dst);
+    auto stop = high_resolution_clock::now();
+    //The time after the histogram has been computed
+
+    // Time difference in microseconds
+    auto duration = duration_cast<microseconds>(stop - start);
+
+    cout << "Execution time:"<< duration.count() << endl;
+
+    imshow("Source image", src);
+    imshow("Equalized Image", dst);
+    waitKey();
+    return 0;
 }
-
-// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
-// Debug program: F5 or Debug > Start Debugging menu
-
-// Tips for Getting Started: 
-//   1. Use the Solution Explorer window to add/manage files
-//   2. Use the Team Explorer window to connect to source control
-//   3. Use the Output window to see build output and other messages
-//   4. Use the Error List window to view errors
-//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
-//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
