@@ -54,7 +54,7 @@ __global__ void histogram(const uint8_t* image, uint32_t* histogram)
 
 // Naive implementation of inclusive scan algorithm based on the exclusive scan presented in
 // https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf 
-// Doesn't work
+// The above example doesn't work when adapted because of a __syncthreads() issue?
 // It uses a continuous double buffer, so a single memory location with twice the number of slots as the input.
 // The complexity of this is O(N*logN) whereas the trivial CPU single threaded version is O(N).
 // It handles only arrays smaller than max number of threads per 1 block.
