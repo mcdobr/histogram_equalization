@@ -78,6 +78,10 @@ __global__ void equalize_image(const uint8_t* original_image, const size_t numbe
     equalized_image[index] = cdf[original_image[index]] * (number_of_bins - 1) / number_of_pixels;
 }
 
+int get_elapsed_time(float time_in_miliseconds) {
+    return (int)(time_in_miliseconds * 1000);
+}
+
 // Also see https://www.mygreatlearning.com/blog/histogram-equalization-explained/#Algorithm
 int main(int argc, char** argv)
 {
@@ -118,7 +122,7 @@ int main(int argc, char** argv)
     cudaEventElapsedTime(&transfer_elapsed_time, start_transfer, end_transfer);
     cudaEventDestroy(start_transfer);
     cudaEventDestroy(end_transfer);
-    cout << std::setprecision(5) << "The time to transfer image to GPU: " << transfer_elapsed_time << " ms\n";
+    cout << "The time to transfer image to GPU: " << get_elapsed_time(transfer_elapsed_time) << " microseconds\n";
 
     // Time histogram equalization
     cudaEvent_t start_histogram_equalization, end_histogram_equalization;
@@ -172,8 +176,8 @@ int main(int argc, char** argv)
                          end_histogram_equalization);
     cudaEventDestroy(start_histogram_equalization);
     cudaEventDestroy(end_histogram_equalization);
-    cout << std::setprecision(5) << "The time to equalize the histogram on the GPU for the input image: " <<
-        histogram_equalization_elapsed_time << " ms\n";
+    cout << "The time to equalize the histogram on the GPU for the input image: " <<
+        get_elapsed_time(histogram_equalization_elapsed_time) << " microseconds\n";
 
 
     // Time the transfer back to the CPU
@@ -196,13 +200,12 @@ int main(int argc, char** argv)
     cudaEventElapsedTime(&transfer_back_elapsed_time, start_transfer_back, end_transfer_back);
     cudaEventDestroy(start_transfer_back);
     cudaEventDestroy(end_transfer_back);
-    cout << std::setprecision(5) << "The time to transfer the equalized image back to CPU: " <<
-        transfer_back_elapsed_time << " ms\n";
+    cout << "The time to transfer the equalized image back to CPU: " <<
+        get_elapsed_time(transfer_back_elapsed_time) << " microseconds\n";
 
 
-    cout << std::setprecision(5) <<
-        "The total time (without loading initial image from filesystem and displaying them at the end): "
-        << transfer_elapsed_time + histogram_equalization_elapsed_time + transfer_back_elapsed_time << " ms\n";
+    cout << "The total time (without loading initial image from filesystem and displaying them at the end): "
+        << get_elapsed_time(transfer_elapsed_time + histogram_equalization_elapsed_time + transfer_back_elapsed_time) << " microseconds\n";
 
     // Create and image for displaying
     Mat equalized_image = Mat(image.rows, image.cols, CV_8UC1, host_equalized_image);
