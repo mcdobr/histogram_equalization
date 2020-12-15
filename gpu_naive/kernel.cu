@@ -78,8 +78,8 @@ __global__ void equalize_image(const uint8_t* original_image, const size_t numbe
     equalized_image[index] = cdf[original_image[index]] * (number_of_bins - 1) / number_of_pixels;
 }
 
-int get_elapsed_time(float time_in_miliseconds) {
-    return (int)(time_in_miliseconds * 1000);
+int get_elapsed_time(float time_in_milliseconds) {
+    return (int)(time_in_milliseconds * 1000);
 }
 
 // Also see https://www.mygreatlearning.com/blog/histogram-equalization-explained/#Algorithm
