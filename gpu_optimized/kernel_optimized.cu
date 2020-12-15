@@ -46,11 +46,32 @@ Mat read_image(const string image_path)
     return image;
 }
 
-__global__ void histogram(const uint8_t* image, uint32_t* histogram)
+__global__ void histogram(const uint8_t* image, uint32_t* histogram, const size_t number_of_pixels)
 {
-    const uint32_t index = blockDim.x * blockIdx.x + threadIdx.x;
-    atomicAdd(&histogram[image[index]], 1);
+    const uint32_t tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    // Initialize shared memory of block with all zeroes
+    __shared__ uint32_t block_histogram[number_of_bins];
+    if (threadIdx.x < number_of_bins) 
+    {
+        block_histogram[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    // Count all the pixel values of the pixels assigned to current block
+    for (size_t index = tid; index < number_of_pixels; index += (gridDim.x * blockDim.x))
+    {
+        atomicAdd(&block_histogram[image[index]], 1);
+    }
+    __syncthreads();
+
+    // Add the partial appearance counters to the total appearances counters in global memory
+    if (threadIdx.x < number_of_bins) 
+    {
+        atomicAdd(&histogram[threadIdx.x], block_histogram[threadIdx.x]);
+    }
 }
+
 
 // Naive implementation of inclusive scan algorithm based on the exclusive scan presented in
 // https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf 
@@ -71,11 +92,17 @@ __global__ void scan(uint32_t* output, const uint32_t* const input, const uint32
     }
 }
 
-__global__ void equalize_image(const uint8_t* original_image, const size_t number_of_pixels, const uint32_t* cdf,
-                               uint8_t* equalized_image)
-{
-    const int index = blockDim.x * blockIdx.x + threadIdx.x;
-    equalized_image[index] = cdf[original_image[index]] * (number_of_bins - 1) / number_of_pixels;
+__global__ void equalize_image(const uint8_t* original_image, 
+    const size_t number_of_pixels, 
+    const uint32_t* cdf,
+    uint8_t* equalized_image
+ ) 
+ {
+    const size_t thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+    for (size_t index = thread_id; index < number_of_pixels; index += (gridDim.x * blockDim.x))
+    {
+        equalized_image[index] = cdf[original_image[index]] * (number_of_bins - 1) / number_of_pixels;
+    }
 }
 
 int get_elapsed_time(float time_in_milliseconds) {
@@ -135,13 +162,14 @@ int main(int argc, char** argv)
     gpu_error_check(cudaMalloc(&dev_histogram, number_of_bins * sizeof(uint32_t)));
     gpu_error_check(cudaMemset(dev_histogram, 0, number_of_bins * sizeof(uint32_t)));
 
-    // Compute histogram of image using a naive kernel
+    // Compute histogram of image
     cudaEvent_t start_histogram, end_histogram;
     cudaEventCreate(&start_histogram);
     cudaEventCreate(&end_histogram);
     cudaEventRecord(start_histogram);
 
-    histogram<<<number_of_pixels / max_threads_per_block, max_threads_per_block>>>(dev_image, dev_histogram);
+    size_t histogram_thread_load_factor = 128;
+    histogram << <number_of_pixels / max_threads_per_block / histogram_thread_load_factor, max_threads_per_block >> > (dev_image, dev_histogram, number_of_pixels);
     gpu_error_check(cudaGetLastError());
     gpu_error_check(cudaDeviceSynchronize());
 
@@ -152,6 +180,7 @@ int main(int argc, char** argv)
     cudaEventDestroy(start_histogram);
     cudaEventDestroy(end_histogram);
     cout << "The time to compute histogram: " << get_elapsed_time(histogram_elapsed_time) << " microseconds\n";
+
 
     // Compute the cumulative distribution function using a naive
     uint32_t* dev_cdf = nullptr;
@@ -164,7 +193,7 @@ int main(int argc, char** argv)
     gpu_error_check(cudaMemcpy(temp, dev_histogram, number_of_bins * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
     for (uint32_t offset = 1; offset < number_of_bins; offset *= 2)
     {
-        scan<<<1, number_of_bins, 2 * number_of_bins * sizeof(int32_t)>>>(dev_cdf, temp, number_of_bins, offset);
+        scan << <1, number_of_bins, 2 * number_of_bins * sizeof(int32_t) >> > (dev_cdf, temp, number_of_bins, offset);
         gpu_error_check(cudaGetLastError());
         gpu_error_check(cudaDeviceSynchronize());
         if (offset * 2 < number_of_bins)
@@ -176,7 +205,9 @@ int main(int argc, char** argv)
     // Compute the new image values
     uint8_t* dev_equalized_image = nullptr;
     gpu_error_check(cudaMalloc(&dev_equalized_image, number_of_pixels * sizeof(uint8_t)));
-    equalize_image<<<number_of_pixels / max_threads_per_block, max_threads_per_block>>>(
+
+    const size_t map_pixels_thread_load_factor = 1;
+    equalize_image << <number_of_pixels / max_threads_per_block / map_pixels_thread_load_factor, max_threads_per_block >> > (
         dev_image, number_of_pixels, dev_cdf, dev_equalized_image);
     gpu_error_check(cudaGetLastError());
     gpu_error_check(cudaDeviceSynchronize());
@@ -186,7 +217,7 @@ int main(int argc, char** argv)
 
     float histogram_equalization_elapsed_time;
     cudaEventElapsedTime(&histogram_equalization_elapsed_time, start_histogram_equalization,
-                         end_histogram_equalization);
+        end_histogram_equalization);
     cudaEventDestroy(start_histogram_equalization);
     cudaEventDestroy(end_histogram_equalization);
     cout << "The time to equalize the histogram on the GPU for the input image: " <<
