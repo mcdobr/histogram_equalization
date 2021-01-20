@@ -256,9 +256,9 @@ int main(int argc, char** argv)
     // Create and image for displaying
     Mat equalized_image = Mat(image.rows, image.cols, CV_8UC1, host_equalized_image);
 
-    imshow("Original image", image);
-    imshow("Equalized image", equalized_image);
-    waitKey(0);
+    // imshow("Original image", image);
+    // imshow("Equalized image", equalized_image);
+    // waitKey(0);
 
     // Free all memory
     free(host_image);
