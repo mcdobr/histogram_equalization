@@ -99,9 +99,11 @@ __global__ void equalize_image(const uint8_t* original_image,
  ) 
  {
     const size_t thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+    const float factor = 1.0f * (number_of_bins - 1) / number_of_pixels;
+
     for (size_t index = thread_id; index < number_of_pixels; index += (gridDim.x * blockDim.x))
     {
-        equalized_image[index] = cdf[original_image[index]] * (number_of_bins - 1) / number_of_pixels;
+        equalized_image[index] = (uint8_t)(cdf[original_image[index]] * factor);
     }
 }
 
@@ -254,9 +256,9 @@ int main(int argc, char** argv)
     // Create and image for displaying
     Mat equalized_image = Mat(image.rows, image.cols, CV_8UC1, host_equalized_image);
 
-    // imshow("Original image", image);
-    // imshow("Equalized image", equalized_image);
-    // waitKey(0);
+    imshow("Original image", image);
+    imshow("Equalized image", equalized_image);
+    waitKey(0);
 
     // Free all memory
     free(host_image);
