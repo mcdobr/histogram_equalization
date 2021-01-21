@@ -208,7 +208,7 @@ int main(int argc, char** argv)
     uint8_t* dev_equalized_image = nullptr;
     gpu_error_check(cudaMalloc(&dev_equalized_image, number_of_pixels * sizeof(uint8_t)));
 
-    const size_t map_pixels_thread_load_factor = 1;
+    const size_t map_pixels_thread_load_factor = 256;
     equalize_image << <number_of_pixels / max_threads_per_block / map_pixels_thread_load_factor, max_threads_per_block >> > (
         dev_image, number_of_pixels, dev_cdf, dev_equalized_image);
     gpu_error_check(cudaGetLastError());
